@@ -2,6 +2,8 @@ package pkcs7
 
 import (
 	"bytes"
+	"encoding/asn1"
+	"errors"
 	"testing"
 )
 
@@ -289,3 +291,258 @@ AoGAOsdn3Prnh/mjC95vraHCLap0bRBSexMdx77ImHgtFUUcSaT8DJHs+NZw1RdM
 SZA0J+zVQ8q7B11jIgz5hMz+chedwoRjTL7a8VRTKHFmmBH0zlEuV7L79w6HkRCQ
 VRg10GUN6heGLv0aOHbPdobcuVDH4sgOqpT1QnOuce34sQs=
 -----END RSA PRIVATE KEY-----`
+
+func TestUnpad(t *testing.T) {
+	tests := []struct {
+		name      string
+		data      []byte
+		blocklen  int
+		expected  []byte
+		expectErr error
+	}{
+		{name: "valid single block", data: []byte{0x1, 0x2, 0x3, 0x10, 0x4, 0x4, 0x4, 0x4}, blocklen: 8, expected: []byte{0x1, 0x2, 0x3, 0x10}},
+		{name: "valid full block padding", data: []byte{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x8, 0x8, 0x8, 0x8, 0x8, 0x8, 0x8, 0x8}, blocklen: 8, expected: []byte{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8}},
+		{name: "empty data", data: []byte{}, blocklen: 8, expectErr: ErrInvalidCiphertextLength},
+		{name: "data not multiple of block size", data: []byte{0x1, 0x2, 0x3}, blocklen: 8, expectErr: ErrInvalidCiphertextLength},
+		{name: "zero padding length", data: []byte{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x0}, blocklen: 8, expectErr: ErrInvalidPadding},
+		{name: "padding length exceeds block size", data: []byte{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x9}, blocklen: 8, expectErr: ErrInvalidPadding},
+		{name: "padding bytes not identical", data: []byte{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x8, 0x8}, blocklen: 8, expectErr: ErrInvalidPadding},
+		{name: "invalid blocklen", data: []byte{0x1}, blocklen: 0, expectErr: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := unpad(tt.data, tt.blocklen)
+			if tt.expectErr != nil {
+				if !errors.Is(err, tt.expectErr) {
+					t.Fatalf("expected error %v, got %v", tt.expectErr, err)
+				}
+				if result != nil {
+					t.Fatalf("expected no plaintext on failure, got %X", result)
+				}
+				return
+			}
+			if tt.blocklen < 1 {
+				if err == nil {
+					t.Fatal("expected error for invalid blocklen")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !bytes.Equal(result, tt.expected) {
+				t.Fatalf("unpad mismatch:\n\tExpected: %X\n\tActual: %X", tt.expected, result)
+			}
+		})
+	}
+}
+
+// corruptedEncryptedData returns a copy of p7's encryptedData with the
+// encrypted content replaced by the given raw value.
+func corruptedEncryptedData(t *testing.T, p7 *PKCS7, content asn1.RawValue) *PKCS7 {
+	t.Helper()
+	ed, ok := p7.raw.(encryptedData)
+	if !ok {
+		t.Fatalf("expected encryptedData, got %T", p7.raw)
+	}
+	ed.EncryptedContentInfo.EncryptedContent = content
+	return &PKCS7{raw: ed}
+}
+
+func encryptedContentBytes(t *testing.T, p7 *PKCS7) []byte {
+	t.Helper()
+	ed, ok := p7.raw.(encryptedData)
+	if !ok {
+		t.Fatalf("expected encryptedData, got %T", p7.raw)
+	}
+	return ed.EncryptedContentInfo.EncryptedContent.Bytes
+}
+
+func TestDecryptFailureAtomicity(t *testing.T) {
+	oldAlg := ContentEncryptionAlgorithm
+	defer func() { ContentEncryptionAlgorithm = oldAlg }()
+	ContentEncryptionAlgorithm = EncryptionAlgorithmDESCBC
+
+	key := []byte("64BitKey")
+	plaintext := []byte("Hello Secret World!") // spans multiple DES blocks
+	der, err := EncryptUsingPSK(plaintext, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p7good, err := Parse(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validContent := encryptedContentBytes(t, p7good)
+
+	// sanity: the valid message decrypts
+	content, err := p7good.DecryptUsingPSK(key)
+	if err != nil {
+		t.Fatalf("cannot decrypt valid content: %v", err)
+	}
+	if !bytes.Equal(content, plaintext) {
+		t.Fatalf("decrypted content mismatch:\n\tExpected: %s\n\tActual: %s", plaintext, content)
+	}
+
+	badPadding := make([]byte, len(validContent))
+	copy(badPadding, validContent)
+	badPadding[len(badPadding)-1] ^= 0xFF
+
+	truncated := make([]byte, len(validContent)-1)
+	copy(truncated, validContent)
+
+	tests := []struct {
+		name      string
+		content   asn1.RawValue
+		expectErr error
+	}{
+		{
+			name:      "empty ciphertext",
+			content:   asn1.RawValue{Bytes: nil},
+			expectErr: ErrInvalidCiphertextLength,
+		},
+		{
+			name:      "ciphertext not a multiple of block size",
+			content:   asn1.RawValue{Bytes: truncated},
+			expectErr: ErrInvalidCiphertextLength,
+		},
+		{
+			name:      "invalid padding",
+			content:   asn1.RawValue{Bytes: badPadding},
+			expectErr: ErrInvalidPadding,
+		},
+		{
+			name:      "truncated compound ASN.1 content",
+			content:   asn1.RawValue{IsCompound: true, Bytes: []byte{0x04, 0x08, 0x01, 0x02}},
+			expectErr: ErrMalformedEncryptedContent,
+		},
+		{
+			name:      "non OCTET STRING in compound content",
+			content:   asn1.RawValue{IsCompound: true, Bytes: []byte{0x02, 0x01, 0x05}},
+			expectErr: ErrMalformedEncryptedContent,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p7bad := corruptedEncryptedData(t, p7good, tt.content)
+			content, err := p7bad.DecryptUsingPSK(key)
+			if !errors.Is(err, tt.expectErr) {
+				t.Fatalf("expected error %v, got %v", tt.expectErr, err)
+			}
+			if content != nil {
+				t.Fatalf("partial plaintext leaked on failure: %X", content)
+			}
+			if p7bad.Content != nil {
+				t.Fatalf("content object updated on failed decryption: %X", p7bad.Content)
+			}
+		})
+	}
+
+	// the same decryption object must still process valid content from a
+	// clean state after the failures above
+	content, err = p7good.DecryptUsingPSK(key)
+	if err != nil {
+		t.Fatalf("cannot decrypt valid content after failures: %v", err)
+	}
+	if !bytes.Equal(content, plaintext) {
+		t.Fatalf("decrypted content mismatch after failures:\n\tExpected: %s\n\tActual: %s", plaintext, content)
+	}
+}
+
+func TestDecryptCompoundContent(t *testing.T) {
+	oldAlg := ContentEncryptionAlgorithm
+	defer func() { ContentEncryptionAlgorithm = oldAlg }()
+	ContentEncryptionAlgorithm = EncryptionAlgorithmDESCBC
+
+	key := []byte("64BitKey")
+	plaintext := []byte("Hello Secret World!") // multi-block ciphertext
+	der, err := EncryptUsingPSK(plaintext, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p7good, err := Parse(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext := encryptedContentBytes(t, p7good)
+
+	// split the ciphertext into a constructed content of two OCTET STRINGs
+	var buf bytes.Buffer
+	for _, chunk := range [][]byte{ciphertext[:8], ciphertext[8:]} {
+		encoded, err := asn1.Marshal(chunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(encoded)
+	}
+	p7compound := corruptedEncryptedData(t, p7good, asn1.RawValue{IsCompound: true, Bytes: buf.Bytes()})
+	content, err := p7compound.DecryptUsingPSK(key)
+	if err != nil {
+		t.Fatalf("cannot decrypt compound content: %v", err)
+	}
+	if !bytes.Equal(content, plaintext) {
+		t.Fatalf("compound content mismatch:\n\tExpected: %s\n\tActual: %s", plaintext, content)
+	}
+}
+
+func TestDecryptSingleBlockFullPadding(t *testing.T) {
+	oldAlg := ContentEncryptionAlgorithm
+	defer func() { ContentEncryptionAlgorithm = oldAlg }()
+	ContentEncryptionAlgorithm = EncryptionAlgorithmDESCBC
+
+	key := []byte("64BitKey")
+	// plaintext exactly one block long: encryption appends a full padding block
+	plaintext := []byte("12345678")
+	der, err := EncryptUsingPSK(plaintext, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p7, err := Parse(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := p7.DecryptUsingPSK(key)
+	if err != nil {
+		t.Fatalf("cannot decrypt single-block full-padding content: %v", err)
+	}
+	if !bytes.Equal(content, plaintext) {
+		t.Fatalf("content mismatch:\n\tExpected: %s\n\tActual: %s", plaintext, content)
+	}
+}
+
+func TestDecryptGCMFailureAtomicity(t *testing.T) {
+	oldAlg := ContentEncryptionAlgorithm
+	defer func() { ContentEncryptionAlgorithm = oldAlg }()
+	ContentEncryptionAlgorithm = EncryptionAlgorithmAES128GCM
+
+	key := []byte("128BitKey4AESGCM")
+	plaintext := []byte("Hello Secret World!")
+	der, err := EncryptUsingPSK(plaintext, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p7good, err := Parse(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext := encryptedContentBytes(t, p7good)
+
+	// truncated GCM ciphertext (authentication tag cut short)
+	p7bad := corruptedEncryptedData(t, p7good, asn1.RawValue{Bytes: ciphertext[:len(ciphertext)-4]})
+	content, err := p7bad.DecryptUsingPSK(key)
+	if err == nil {
+		t.Fatal("expected error for truncated GCM ciphertext")
+	}
+	if content != nil {
+		t.Fatalf("partial plaintext leaked on GCM failure: %X", content)
+	}
+
+	// valid content still decrypts afterwards
+	content, err = p7good.DecryptUsingPSK(key)
+	if err != nil {
+		t.Fatalf("cannot decrypt valid GCM content after failure: %v", err)
+	}
+	if !bytes.Equal(content, plaintext) {
+		t.Fatalf("content mismatch:\n\tExpected: %s\n\tActual: %s", plaintext, content)
+	}
+}

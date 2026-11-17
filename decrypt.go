@@ -27,6 +27,20 @@ var ErrUnsupportedKeyType = errors.New("pkcs7: only RSA keys are supported")
 // ErrNotEncryptedContent is returned when attempting to Decrypt data that is not encrypted data
 var ErrNotEncryptedContent = errors.New("pkcs7: content data is a decryptable data type")
 
+// ErrMalformedEncryptedContent is returned when the ASN.1 structure of the
+// encrypted content itself is malformed, e.g. a truncated constructed
+// OCTET STRING. No plaintext is produced in this case.
+var ErrMalformedEncryptedContent = errors.New("pkcs7: malformed encrypted content")
+
+// ErrInvalidCiphertextLength is returned when the ciphertext is empty or its
+// length is not a multiple of the cipher block size.
+var ErrInvalidCiphertextLength = errors.New("pkcs7: invalid ciphertext length")
+
+// ErrInvalidPadding is returned when the PKCS#7 padding of the decrypted
+// content is invalid: a padding length of zero, a padding length larger
+// than the block size, or padding bytes that are not all identical.
+var ErrInvalidPadding = errors.New("pkcs7: invalid padding")
+
 // Decrypt decrypts encrypted content info for recipient cert and private key
 func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte, error) {
 	data, ok := p7.raw.(envelopedData)
@@ -124,16 +138,23 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 	// or _be_ a tagged OCTET STRING
 	var cyphertext []byte
 	if eci.EncryptedContent.IsCompound {
-		// Complex case to concat all of the children OCTET STRINGs
+		// Complex case to concat all of the children OCTET STRINGs. Any
+		// parsing failure aborts the whole decryption: no partial
+		// ciphertext (and hence no partial plaintext) may be produced.
 		var buf bytes.Buffer
 		cypherbytes := eci.EncryptedContent.Bytes
-		for {
+		for len(cypherbytes) > 0 {
 			var part []byte
-			cypherbytes, _ = asn1.Unmarshal(cypherbytes, &part)
-			buf.Write(part)
-			if cypherbytes == nil {
-				break
+			rest, err := asn1.Unmarshal(cypherbytes, &part)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrMalformedEncryptedContent, err)
 			}
+			if len(rest) >= len(cypherbytes) {
+				// defensive: parsing must make progress
+				return nil, ErrMalformedEncryptedContent
+			}
+			buf.Write(part)
+			cypherbytes = rest
 		}
 		cyphertext = buf.Bytes()
 	} else {
@@ -192,6 +213,13 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 	if len(iv) != block.BlockSize() {
 		return nil, errors.New("pkcs7: encryption algorithm parameters are malformed")
 	}
+	// The ciphertext must be a non-empty multiple of the block size;
+	// checking before decrypting keeps cipher.CryptBlocks from panicking
+	// and guarantees no partial plaintext is ever produced.
+	if len(cyphertext) == 0 || len(cyphertext)%block.BlockSize() != 0 {
+		return nil, fmt.Errorf("%w: ciphertext length %d is not a multiple of block size %d",
+			ErrInvalidCiphertextLength, len(cyphertext), block.BlockSize())
+	}
 	mode := cipher.NewCBCDecrypter(block, iv)
 	plaintext := make([]byte, len(cyphertext))
 	mode.CryptBlocks(plaintext, cyphertext)
@@ -206,17 +234,23 @@ func unpad(data []byte, blocklen int) ([]byte, error) {
 		return nil, fmt.Errorf("pkcs7: invalid blocklen %d", blocklen)
 	}
 	if len(data)%blocklen != 0 || len(data) == 0 {
-		return nil, fmt.Errorf("pkcs7: invalid data len %d", len(data))
+		return nil, fmt.Errorf("%w: %d", ErrInvalidCiphertextLength, len(data))
 	}
 
-	// the last byte is the length of padding
+	// the last byte is the length of the padding
 	padlen := int(data[len(data)-1])
+
+	// the padding must consist of at least one byte and at most a full
+	// block; anything else is invalid and must not be used to slice data
+	if padlen < 1 || padlen > blocklen || padlen > len(data) {
+		return nil, fmt.Errorf("%w: invalid padding length %d", ErrInvalidPadding, padlen)
+	}
 
 	// check padding integrity, all bytes should be the same
 	pad := data[len(data)-padlen:]
 	for _, padbyte := range pad {
 		if padbyte != byte(padlen) {
-			return nil, errors.New("pkcs7: invalid padding")
+			return nil, ErrInvalidPadding
 		}
 	}
 
