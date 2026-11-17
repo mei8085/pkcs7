@@ -102,13 +102,17 @@ func getHashForOID(oid asn1.ObjectIdentifier) (crypto.Hash, error) {
 	switch {
 	case oid.Equal(OIDDigestAlgorithmSHA1), oid.Equal(OIDDigestAlgorithmECDSASHA1),
 		oid.Equal(OIDDigestAlgorithmDSA), oid.Equal(OIDDigestAlgorithmDSASHA1),
-		oid.Equal(OIDEncryptionAlgorithmRSA):
+		oid.Equal(OIDEncryptionAlgorithmRSA),
+		oid.Equal(OIDEncryptionAlgorithmRSASHA1):
 		return crypto.SHA1, nil
-	case oid.Equal(OIDDigestAlgorithmSHA256), oid.Equal(OIDDigestAlgorithmECDSASHA256):
+	case oid.Equal(OIDDigestAlgorithmSHA256), oid.Equal(OIDDigestAlgorithmECDSASHA256),
+		oid.Equal(OIDEncryptionAlgorithmRSASHA256):
 		return crypto.SHA256, nil
-	case oid.Equal(OIDDigestAlgorithmSHA384), oid.Equal(OIDDigestAlgorithmECDSASHA384):
+	case oid.Equal(OIDDigestAlgorithmSHA384), oid.Equal(OIDDigestAlgorithmECDSASHA384),
+		oid.Equal(OIDEncryptionAlgorithmRSASHA384):
 		return crypto.SHA384, nil
-	case oid.Equal(OIDDigestAlgorithmSHA512), oid.Equal(OIDDigestAlgorithmECDSASHA512):
+	case oid.Equal(OIDDigestAlgorithmSHA512), oid.Equal(OIDDigestAlgorithmECDSASHA512),
+		oid.Equal(OIDEncryptionAlgorithmRSASHA512):
 		return crypto.SHA512, nil
 	}
 	return crypto.Hash(0), ErrUnsupportedAlgorithm
