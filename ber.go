@@ -3,7 +3,15 @@ package pkcs7
 import (
 	"bytes"
 	"errors"
+	"fmt"
 )
+
+// maxBerDepth bounds the nesting depth of constructed BER objects. readObject
+// is recursive, so without this cap a deeply nested input could exhaust the
+// goroutine stack and crash the process with an unrecoverable stack-overflow
+// instead of returning an error. The value is far above any legitimate ASN.1
+// structure while staying well below the recursion depth the stack can hold.
+const maxBerDepth = 1000
 
 type asn1Object interface {
 	EncodeTo(writer *bytes.Buffer) error
@@ -56,15 +64,20 @@ func ber2der(ber []byte) ([]byte, error) {
 	// fmt.Printf("--> ber2der: Transcoding %d bytes\n", len(ber))
 	out := new(bytes.Buffer)
 
-	obj, _, err := readObject(ber, 0)
+	// readObject starts at depth 1 (the outer object) and recurses one level
+	// per constructed object. The output buffer stays internal until parsing
+	// has fully succeeded, so a failed conversion never returns a half-written
+	// DER fragment and every call starts from a clean state.
+	obj, end, err := readObject(ber, 0, 1)
 	if err != nil {
 		return nil, err
 	}
-	obj.EncodeTo(out)
-
-	// if offset < len(ber) {
-	//	return nil, fmt.Errorf("ber2der: Content longer than expected. Got %d, expected %d", offset, len(ber))
-	// }
+	if end != len(ber) {
+		return nil, fmt.Errorf("ber2der: trailing data after BER object: %d byte(s) past offset %d", len(ber)-end, end)
+	}
+	if err = obj.EncodeTo(out); err != nil {
+		return nil, err
+	}
 
 	return out.Bytes(), nil
 }
@@ -127,7 +140,10 @@ func encodeLength(out *bytes.Buffer, length int) (err error) {
 	return
 }
 
-func readObject(ber []byte, offset int) (asn1Object, int, error) {
+func readObject(ber []byte, offset int, depth int) (asn1Object, int, error) {
+	if depth > maxBerDepth {
+		return nil, 0, fmt.Errorf("ber2der: BER nesting depth exceeded maximum of %d", maxBerDepth)
+	}
 	berLen := len(ber)
 	if offset >= berLen {
 		return nil, 0, errors.New("ber2der: offset is after end of ber data")
@@ -225,9 +241,16 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 		for (offset < contentEnd) || indefinite {
 			var subObj asn1Object
 			var err error
-			subObj, offset, err = readObject(ber, offset)
+			subObj, offset, err = readObject(ber, offset, depth+1)
 			if err != nil {
 				return nil, 0, err
+			}
+			// A definite-length constructed object owns exactly [offset,contentEnd):
+			// every child TLV must end inside that range. Otherwise the child's
+			// declared length reaches past the enclosing object, which is malformed
+			// BER and must not be silently absorbed.
+			if !indefinite && offset > contentEnd {
+				return nil, 0, errors.New("ber2der: BER child object exceeds the enclosing object's declared content length")
 			}
 			subObjects = append(subObjects, subObj)
 
