@@ -8,11 +8,13 @@ import (
 	"crypto/des"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/subtle"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"io"
 )
 
 // ErrUnsupportedAlgorithm tells you when our quick dev assumptions have failed
@@ -27,38 +29,115 @@ var ErrUnsupportedKeyType = errors.New("pkcs7: only RSA keys are supported")
 // ErrNotEncryptedContent is returned when attempting to Decrypt data that is not encrypted data
 var ErrNotEncryptedContent = errors.New("pkcs7: content data is a decryptable data type")
 
-// Decrypt decrypts encrypted content info for recipient cert and private key
+// ErrDecryption is returned when the encrypted content key or the encrypted
+// content itself cannot be decrypted. The cause is deliberately not reported
+// in detail: invalid padding, an unusable content key and a failure to decrypt
+// the content all produce this exact same error, so that they cannot be told
+// apart (see RFC 3218, Preventing the Million Message Attack on Cryptographic
+// Message Syntax).
+var ErrDecryption = errors.New("pkcs7: decryption failed")
+
+// Decrypt decrypts encrypted content info for recipient cert and private key.
+//
+// RSAES-PKCS1-v1_5 encrypted content keys are decrypted using implicit
+// rejection: a random content key of the size required by the content
+// encryption algorithm is used whenever the encrypted key is malformed or
+// cannot be recovered. The content decryption is always attempted, so invalid
+// padding, a content key of the wrong length and a failure to decrypt the
+// content are indistinguishable through the returned error or through the
+// sequence of operations performed.
 func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte, error) {
 	data, ok := p7.raw.(envelopedData)
 	if !ok {
 		return nil, ErrNotEncryptedContent
 	}
+	if cert == nil {
+		return nil, errors.New("pkcs7: no certificate provided")
+	}
 	recipient := selectRecipientForCertificate(data.RecipientInfos, cert)
 	if recipient.EncryptedKey == nil {
 		return nil, errors.New("pkcs7: no enveloped recipient for provided certificate")
 	}
-	switch pkey := pkey.(type) {
-	case crypto.Decrypter:
-		var opts crypto.DecrypterOpts
-		switch algorithm := recipient.KeyEncryptionAlgorithm.Algorithm; {
-		case algorithm.Equal(OIDEncryptionAlgorithmRSAESOAEP):
-			hashFunc, err := getHashFuncForKeyEncryptionAlgorithm(recipient.KeyEncryptionAlgorithm)
-			if err != nil {
-				return nil, err
-			}
-			opts = &rsa.OAEPOptions{Hash: hashFunc}
-		case algorithm.Equal(OIDEncryptionAlgorithmRSA):
-			opts = &rsa.PKCS1v15DecryptOptions{}
-		default:
-			return nil, ErrUnsupportedAsymmetricEncryptionAlgorithm
-		}
-		contentKey, err := pkey.Decrypt(rand.Reader, recipient.EncryptedKey, opts)
+	decrypter, ok := pkey.(crypto.Decrypter)
+	if !ok {
+		return nil, ErrUnsupportedAlgorithm
+	}
+
+	// The content encryption algorithm is part of the message and does not
+	// depend on the encrypted key, so failing here does not leak any
+	// information about the encrypted key's padding.
+	keyLen, err := contentEncryptionKeyLen(data.EncryptedContentInfo.ContentEncryptionAlgorithm.Algorithm)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate a random content key up front, regardless of the outcome of
+	// the key decryption below, so the work performed does not depend on the
+	// validity of the encrypted key.
+	fallbackKey, err := randomContentKey(keyLen)
+	if err != nil {
+		return nil, err
+	}
+
+	var contentKey []byte
+	keyOK := true
+	switch algorithm := recipient.KeyEncryptionAlgorithm.Algorithm; {
+	case algorithm.Equal(OIDEncryptionAlgorithmRSAESOAEP):
+		hashFunc, err := getHashFuncForKeyEncryptionAlgorithm(recipient.KeyEncryptionAlgorithm)
 		if err != nil {
 			return nil, err
 		}
-		return data.EncryptedContentInfo.decrypt(contentKey)
+		contentKey, err = decrypter.Decrypt(rand.Reader, recipient.EncryptedKey, &rsa.OAEPOptions{Hash: hashFunc})
+		if err != nil || len(contentKey) != keyLen {
+			keyOK = false
+		}
+	case algorithm.Equal(OIDEncryptionAlgorithmRSA):
+		contentKey, keyOK = decryptPKCS1v15ContentKey(decrypter, recipient.EncryptedKey, keyLen)
+	default:
+		return nil, ErrUnsupportedAsymmetricEncryptionAlgorithm
 	}
-	return nil, ErrUnsupportedAlgorithm
+	if !keyOK {
+		// Continue with the random key so that the content decryption runs
+		// unconditionally, whether the content key could be recovered or not.
+		contentKey = fallbackKey
+	}
+
+	// The content decryption is attempted even when the content key could not
+	// be recovered, so that the same work is performed in every case.
+	plaintext, err := data.EncryptedContentInfo.decrypt(contentKey)
+	if err != nil || !keyOK {
+		// Do not expose why the content could not be decrypted: invalid
+		// padding, a content key of an unexpected size and corrupt content
+		// must all fail in the same way.
+		return nil, ErrDecryption
+	}
+	return plaintext, nil
+}
+
+// decryptPKCS1v15ContentKey decrypts a content encryption key using RSAES-
+// PKCS1-v1_5. If the encrypted key is not validly padded or does not contain a
+// key of exactly keyLen bytes, keyOK is false; the caller must then continue
+// with the content decryption using a random key of keyLen bytes, but report a
+// uniform failure, so that padding validity is not observable (see RFC 3218,
+// Preventing the Million Message Attack on Cryptographic Message Syntax).
+func decryptPKCS1v15ContentKey(decrypter crypto.Decrypter, encryptedKey []byte, keyLen int) (contentKey []byte, keyOK bool) {
+	// The padding is verified by crypto/rsa in constant time. A malformed
+	// ciphertext, invalid padding and a recovered key of the wrong size are
+	// all collapsed into keyOK being false, without reporting which happened.
+	contentKey, err := decrypter.Decrypt(rand.Reader, encryptedKey, &rsa.PKCS1v15DecryptOptions{})
+	if err != nil || len(contentKey) != keyLen {
+		return nil, false
+	}
+	return contentKey, true
+}
+
+// randomContentKey returns a random content encryption key of keyLen bytes.
+func randomContentKey(keyLen int) ([]byte, error) {
+	key := make([]byte, keyLen)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return nil, err
+	}
+	return key, nil
 }
 
 // RFC 4055, 4.1
@@ -100,7 +179,8 @@ func getHashFuncForKeyEncryptionAlgorithm(keyEncryptionAlgorithm pkix.AlgorithmI
 }
 
 // DecryptUsingPSK decrypts encrypted data using caller provided
-// pre-shared secret
+// pre-shared secret. The key must have the length required by the content
+// encryption algorithm of the message (for example 32 bytes for AES-256-CBC).
 func (p7 *PKCS7) DecryptUsingPSK(key []byte) ([]byte, error) {
 	data, ok := p7.raw.(encryptedData)
 	if !ok {
@@ -109,15 +189,35 @@ func (p7 *PKCS7) DecryptUsingPSK(key []byte) ([]byte, error) {
 	return data.EncryptedContentInfo.decrypt(key)
 }
 
+// contentEncryptionKeyLen returns the length in bytes of the content
+// encryption key required by alg. It returns ErrUnsupportedAlgorithm for
+// algorithms that are not supported.
+func contentEncryptionKeyLen(alg asn1.ObjectIdentifier) (int, error) {
+	switch {
+	case alg.Equal(OIDEncryptionAlgorithmDESCBC):
+		return 8, nil
+	case alg.Equal(OIDEncryptionAlgorithmDESEDE3CBC):
+		return 24, nil
+	case alg.Equal(OIDEncryptionAlgorithmAES128CBC), alg.Equal(OIDEncryptionAlgorithmAES128GCM):
+		return 16, nil
+	case alg.Equal(OIDEncryptionAlgorithmAES256CBC), alg.Equal(OIDEncryptionAlgorithmAES256GCM):
+		return 32, nil
+	default:
+		return 0, ErrUnsupportedAlgorithm
+	}
+}
+
 func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 	alg := eci.ContentEncryptionAlgorithm.Algorithm
-	if !alg.Equal(OIDEncryptionAlgorithmDESCBC) &&
-		!alg.Equal(OIDEncryptionAlgorithmDESEDE3CBC) &&
-		!alg.Equal(OIDEncryptionAlgorithmAES256CBC) &&
-		!alg.Equal(OIDEncryptionAlgorithmAES128CBC) &&
-		!alg.Equal(OIDEncryptionAlgorithmAES128GCM) &&
-		!alg.Equal(OIDEncryptionAlgorithmAES256GCM) {
-		return nil, ErrUnsupportedAlgorithm
+	keyLen, err := contentEncryptionKeyLen(alg)
+	if err != nil {
+		return nil, err
+	}
+	// Enforce the key length required by the content encryption algorithm
+	// before the key is used, so that all content encryption algorithms
+	// validate their keys in the same way.
+	if len(key) != keyLen {
+		return nil, errors.New("pkcs7: invalid content encryption key length")
 	}
 
 	// EncryptedContent can either be constructed of multple OCTET STRINGs
@@ -142,7 +242,6 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 	}
 
 	var block cipher.Block
-	var err error
 
 	switch {
 	case alg.Equal(OIDEncryptionAlgorithmDESCBC):
@@ -192,6 +291,11 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 	if len(iv) != block.BlockSize() {
 		return nil, errors.New("pkcs7: encryption algorithm parameters are malformed")
 	}
+	// CryptBlocks panics when the input is not a whole number of blocks;
+	// reject such input instead of crashing.
+	if len(cyphertext) == 0 || len(cyphertext)%block.BlockSize() != 0 {
+		return nil, errors.New("pkcs7: encrypted content is malformed")
+	}
 	mode := cipher.NewCBCDecrypter(block, iv)
 	plaintext := make([]byte, len(cyphertext))
 	mode.CryptBlocks(plaintext, cyphertext)
@@ -209,15 +313,22 @@ func unpad(data []byte, blocklen int) ([]byte, error) {
 		return nil, fmt.Errorf("pkcs7: invalid data len %d", len(data))
 	}
 
-	// the last byte is the length of padding
+	// The last byte is the length of the padding. Because len(data) is a
+	// multiple of blocklen, data is at least one full block long.
 	padlen := int(data[len(data)-1])
 
-	// check padding integrity, all bytes should be the same
-	pad := data[len(data)-padlen:]
-	for _, padbyte := range pad {
-		if padbyte != byte(padlen) {
-			return nil, errors.New("pkcs7: invalid padding")
-		}
+	// Check the padding without branching on whether it is valid: every byte
+	// of a full block is inspected and out-of-range padding lengths are
+	// rejected defensively instead of indexing out of bounds.
+	valid := subtle.ConstantTimeLessOrEq(1, padlen) &
+		subtle.ConstantTimeLessOrEq(padlen, blocklen)
+	for i := 1; i <= blocklen; i++ {
+		inPad := subtle.ConstantTimeLessOrEq(i, padlen)
+		matches := subtle.ConstantTimeByteEq(data[len(data)-i], byte(padlen))
+		valid &= (inPad ^ 1) | matches
+	}
+	if valid != 1 {
+		return nil, errors.New("pkcs7: invalid padding")
 	}
 
 	return data[:len(data)-padlen], nil
