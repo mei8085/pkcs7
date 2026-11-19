@@ -22,13 +22,25 @@ func TestDecrypt(t *testing.T) {
 			expected: "This is a test",
 		},
 		{
+			// All-default parameters: empty RSAES-OAEP-params SEQUENCE,
+			// i.e. SHA-1 with MGF1-SHA-1 and an empty label.
 			name:     "rsa-oaep-sha1",
 			fixture:  RSAOAEPSHA1EncryptedTestFixture,
 			expected: "This is a test",
 		},
 		{
+			// Explicit parameters: hashAlgorithm=sha256 and an explicit
+			// MGF1 maskGenAlgorithm carrying sha256.
 			name:     "rsa-oaep-sha256",
 			fixture:  RSAOAEPSHA256EncryptedTestFixture,
+			expected: "This is a test",
+		},
+		{
+			// Explicit pSpecified label ("test"). crypto/rsa has honoured
+			// OAEPOptions.Label since Go 1.5, so this is not gated on the
+			// Go version.
+			name:     "rsa-oaep-label",
+			fixture:  RSAOAEPLabelEncryptedTestFixture,
 			expected: "This is a test",
 		},
 	}
@@ -47,6 +59,30 @@ func TestDecrypt(t *testing.T) {
 				t.Errorf("decrypted result does not match.\n\tExpected:%s\n\tActual:%s", []byte(tt.expected), content)
 			}
 		})
+	}
+}
+
+// TestDecryptRejectsDeclaredMGFMismatch covers an envelope whose parameters
+// declare SHA-256 as the OAEP digest but omit maskGenAlgorithm, which per RFC
+// 4055 means MGF1-SHA-1, while the key was in fact encrypted with MGF1-SHA-256.
+//
+// This is the historical output of this package: the key encryption
+// parameters only declared the digest and the RSA operation used that digest
+// for MGF1 too. Decryption must not "helpfully" succeed by ignoring the
+// declared mask generation algorithm; it must fail instead, so that a
+// declaration/operation mismatch cannot go unnoticed.
+func TestDecryptRejectsDeclaredMGFMismatch(t *testing.T) {
+	fixture := UnmarshalTestFixture(RSAOAEPSHA256MGFMismatchEncryptedTestFixture)
+	p7, err := Parse(fixture.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := p7.Decrypt(fixture.Certificate, fixture.PrivateKey)
+	if err == nil {
+		t.Fatalf("decrypted content that declares MGF1-SHA-1 but was encrypted with MGF1-SHA-256; got %q", content)
+	}
+	if content != nil {
+		t.Errorf("expected nil plaintext on failure, got %q", content)
 	}
 }
 
@@ -230,7 +266,20 @@ J1h1Q5Z6frEwd4ye/bcpReEScPXOKEB+1b3TWGCWNC2jhfChtZSH1Y3Z3mL0SfwT
 n9txBjxLOx1G83OQYY3J6Bnwkn5/whXGdMlfOR963adQNweQuatB
 -----END RSA PRIVATE KEY-----`
 
-var RSAOAEPSHA256EncryptedTestFixture = `
+// RSAOAEPSHA256MGFMismatchEncryptedTestFixture declares SHA-256 as the OAEP
+// digest but no maskGenAlgorithm, which by RFC 4055 means MGF1-SHA-1, while
+// the encrypted key was in fact produced with MGF1-SHA-256. Decrypting it
+// would mean ignoring the mask generation algorithm the envelope declares, so
+// it must be rejected.
+//
+// This is the shape this package used to write: it only declared the digest,
+// while rsa.EncryptOAEP used that same digest for MGF1 as well.
+//
+//	openssl cms -encrypt -in test.txt -outform pem -recip certificate.pem -aes256 \
+//	    -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256
+//	# OpenSSL then uses SHA-256 for MGF1 too; delete the maskGenAlgorithm
+//	# ([1]) field by hand to obtain the historical declaration.
+var RSAOAEPSHA256MGFMismatchEncryptedTestFixture = `
 -----BEGIN PKCS7-----
 MIIBtgYJKoZIhvcNAQcDoIIBpzCCAaMCAQAxggFeMIIBWgIBADAxMCkxEDAOBgNV
 BAoTB0FjbWUgQ28xFTATBgNVBAMTDEVkZGFyZCBTdGFyawIEItzA4TAeBgkqhkiG
@@ -242,6 +291,138 @@ mZEzfyaB8EEx1br7kW4tQ+DjW2VqMzKdVxNgzhrTR+VLiBkuGVGsdSEfFkJAYfhp
 azux8yBteKsUJG9y+J78DFBwZtOsy4u2Rat895K31GDew3sgHofeeFNHA8kwPAYJ
 KoZIhvcNAQcBMB0GCWCGSAFlAwQBKgQQ4bmABhs/EKBtcfYEwHk2wIAQuA3tdOYV
 oKGnb5jFQi17VA==
+-----END PKCS7-----
+-----BEGIN CERTIFICATE-----
+MIIDETCCAfmgAwIBAgIEItzA4TANBgkqhkiG9w0BAQsFADApMRAwDgYDVQQKEwdB
+Y21lIENvMRUwEwYDVQQDEwxFZGRhcmQgU3RhcmswHhcNMjEwMjIzMTIxODQ2WhcN
+MjIwMjIzMTIxODQ3WjAlMRAwDgYDVQQKEwdBY21lIENvMREwDwYDVQQDEwhKb24g
+U25vdzCCAR8wDQYJKoZIhvcNAQEBBQADggEMADCCAQcCggEAcWPIQrIZColwlCsn
+ZK7ULUEkZHtvMOCaLaHA4laqLuJOeQxAyWpL1m11w3GpFeBwPEdrThoG8b04xaPB
+CuO9MPTvYqWqT1Eq0UWgbEjpZGmiLOjmIeBS8GaajDQVVRLYLlVEfwt+GNqUvZEa
+x7OqvnBoQ2aJZFk+5xsuXkhLzwx4NBAatdYbuh5j5iN69ASJzjaiYNq3Ct1PvsJN
+ZZ2w98rAmbCjqkVJrN5/yFink6l15s9lyidrdDUl8Ig5gPatBpvsNG14d5c4bVD+
+DJc0vpZ8fYSuW480mwlAeUV8DAxv7jTEKguDJgOAT3HknzMgCBY3USxsvyu4G29r
+4jmEbQIBA6NIMEYwDgYDVR0PAQH/BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwME
+MB8GA1UdIwQYMBaAFOy+qIFIokwb/0GSIt4DOBOXMd5vMA0GCSqGSIb3DQEBCwUA
+A4IBAQA8F85MhBw5QxwrwRluL4waSXpxdRNpkN2K59eEqTUc+5lFLhinvX9WwkvR
+ToBiRpvX50GtCWZ/r5Lx2UxTyh3vKsgjhkXcvm6pvVVfqyz5pNQv3v2Q838xM98+
+15srGU9uU71McPZ5MmkmfHfgBaz5CCfUcsroJJ19pebaSARkRnb0bR36voXUbtwM
+F89PLjXUYLxSaWcOpRQ1ju0Kq7K3MDqauPzzl3HtrpGkCsoHMfb5o/HYNj+Pmxfl
+l3QH5xhOzVdioaGwE4SkY5Z5szZ8n+qi/Zd59PBCOpLoXvcB9WRTMmYkxmDOVcwI
+pQfViIYaatHkjbS/2C/Cx0hfb/6S
+-----END CERTIFICATE-----
+-----BEGIN RSA PRIVATE KEY-----
+MIIEnwIBAAKCAQBxY8hCshkKiXCUKydkrtQtQSRke28w4JotocDiVqou4k55DEDJ
+akvWbXXDcakV4HA8R2tOGgbxvTjFo8EK470w9O9ipapPUSrRRaBsSOlkaaIs6OYh
+4FLwZpqMNBVVEtguVUR/C34Y2pS9kRrHs6q+cGhDZolkWT7nGy5eSEvPDHg0EBq1
+1hu6HmPmI3r0BInONqJg2rcK3U++wk1lnbD3ysCZsKOqRUms3n/IWKeTqXXmz2XK
+J2t0NSXwiDmA9q0Gm+w0bXh3lzhtUP4MlzS+lnx9hK5bjzSbCUB5RXwMDG/uNMQq
+C4MmA4BPceSfMyAIFjdRLGy/K7gbb2viOYRtAgEDAoIBAEuX2tchZgcGSw1yGkMf
+OB4rbZhSSiCVvB5r1ew5xsnsNFCy1ducMo7zo9ehG2Pq9X2E8jQRWfZ+JdkX1gdC
+fiCjSkHDxt+LceDZFZ2F8O2bwXNF7sFAN0rvEbLNY44MkB7jgv9c/rs8YykLZy/N
+HH71mteZsO2Q1JoSHumFh99cwWHFhLxYh64qFeeH6Gqx6AM2YVBWHgs7OuKOvc8y
+zUbf8xftPht1kMwwDR1XySiEYtBtn74JflK3DcT8oxOuCZBuX6sMJHKbVP41zDj+
+FJZBmpAvNfCEYJUr1Hg+DpMLqLUg+D6v5vpliburbk9LxcKFZyyZ9QVe7GoqMLBu
+eGsCgYEAummUj4MMKWJC2mv5rj/dt2pj2/B2HtP2RLypai4et1/Ru9nNk8cjMLzC
+qXz6/RLuJ7/eD7asFS3y7EqxKxEmW0G8tTHjnzR/3wnpVipuWnwCDGU032HJVd13
+LMe51GH97qLzuDZjMCz+VlbCNdSslMgWWK0XmRnN7Yqxvh6ao2kCgYEAm7fTRBhF
+JtKcaJ7d8BQb9l8BNHfjayYOMq5CxoCyxa2pGBv/Mrnxv73Twp9Z/MP0ue5M5nZt
+GMovpP5cGdJLQ2w5p4H3opcuWeYW9Yyru2EyCEAI/hD/Td3QVP0ukc19BDuPl5Wg
+eIFs218uiVOU4pw3w+Et5B1PZ/F+ZLr5LGUCgYB8RmMKV11w7CyRnVEe1T56Ru09
+Svlp4qQt0xucHr8k6ovSkTO32hd10yxw/fyot0lv1T61JHK4yUydhyDHYMQ81n3O
+IUJqIv/qBpuOxvQ8UqwIQ3iU69uOk6TIhSaNlqlJwffQJEIgHf7kOdbOjchjMA7l
+yLpmETPzscvUFGcXmwKBgGfP4i1lg283EvBp6Uq4EqQ/ViL6l5zECXce1y8Ady5z
+xhASqiHRS9UpN9cU5qiCoyae3e75nhCGym3+6BE23Nede8UBT8G6HuaZZKOzHSeW
+IVrVW1QLVN6T4DioybaI/gLSX7pjwFBWSJI/dFuNDexoJS1AyUK+NO/2VEMnUMhD
+AoGAOsdn3Prnh/mjC95vraHCLap0bRBSexMdx77ImHgtFUUcSaT8DJHs+NZw1RdM
+SZA0J+zVQ8q7B11jIgz5hMz+chedwoRjTL7a8VRTKHFmmBH0zlEuV7L79w6HkRCQ
+VRg10GUN6heGLv0aOHbPdobcuVDH4sgOqpT1QnOuce34sQs=
+-----END RSA PRIVATE KEY-----`
+
+// RSAOAEPSHA256EncryptedTestFixture declares SHA-256 as both the OAEP digest
+// and the MGF1 digest, which is the pair this package writes and performs.
+//
+//	openssl cms -encrypt -binary -in test.txt -outform pem -recip certificate.pem -aes256 \
+//	    -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256 -keyopt rsa_mgf1_md:sha256
+var RSAOAEPSHA256EncryptedTestFixture = `
+-----BEGIN PKCS7-----
+MIIB0AYJKoZIhvcNAQcDoIIBwTCCAb0CAQAxggF4MIIBdAIBADAxMCkxEDAOBgNV
+BAoTB0FjbWUgQ28xFTATBgNVBAMTDEVkZGFyZCBTdGFyawIEItzA4TA4BgkqhkiG
+9w0BAQcwK6ANMAsGCWCGSAFlAwQCAaEaMBgGCSqGSIb3DQEBCDALBglghkgBZQME
+AgEEggEAN2w0sxx7vhbJMIPLwGV9tbJv0uibzKrAAPvCHXPMA5y4B+F02SycvZcZ
+e4lSuNjgAW2hTJ8o2oMzOgIcQ/iiwo3O9mY3MCOwGJhJx/Pr4Y6M0GoIhRdoa3ur
+0si3gGQt+Le6zmMyEkLLch4xMZMfHiYs9PUsn4D/5jOHv94FW2dTpPPgwfva9vjl
+9J+zw9X3o1kVJ+1UoKnxT+r443nTPTMsJT4aahwLnQlz4WAzWBEW9on2G2ZWHtR9
+qNU1+3IvOMATfFFFakBTpcuhaqrpuszRRMbDVdoeb1zzMgRnVr3IKHs4+QldqR6I
+tWiwNCUcUu2mW97mW94dyybsbWIE3TA8BgkqhkiG9w0BBwEwHQYJYIZIAWUDBAEq
+BBCw2GDmXhtLY+hTNsA2mIf6gBBor7r+4UZaDeshUmeJjlCo
+-----END PKCS7-----
+-----BEGIN CERTIFICATE-----
+MIIDETCCAfmgAwIBAgIEItzA4TANBgkqhkiG9w0BAQsFADApMRAwDgYDVQQKEwdB
+Y21lIENvMRUwEwYDVQQDEwxFZGRhcmQgU3RhcmswHhcNMjEwMjIzMTIxODQ2WhcN
+MjIwMjIzMTIxODQ3WjAlMRAwDgYDVQQKEwdBY21lIENvMREwDwYDVQQDEwhKb24g
+U25vdzCCAR8wDQYJKoZIhvcNAQEBBQADggEMADCCAQcCggEAcWPIQrIZColwlCsn
+ZK7ULUEkZHtvMOCaLaHA4laqLuJOeQxAyWpL1m11w3GpFeBwPEdrThoG8b04xaPB
+CuO9MPTvYqWqT1Eq0UWgbEjpZGmiLOjmIeBS8GaajDQVVRLYLlVEfwt+GNqUvZEa
+x7OqvnBoQ2aJZFk+5xsuXkhLzwx4NBAatdYbuh5j5iN69ASJzjaiYNq3Ct1PvsJN
+ZZ2w98rAmbCjqkVJrN5/yFink6l15s9lyidrdDUl8Ig5gPatBpvsNG14d5c4bVD+
+DJc0vpZ8fYSuW480mwlAeUV8DAxv7jTEKguDJgOAT3HknzMgCBY3USxsvyu4G29r
+4jmEbQIBA6NIMEYwDgYDVR0PAQH/BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwME
+MB8GA1UdIwQYMBaAFOy+qIFIokwb/0GSIt4DOBOXMd5vMA0GCSqGSIb3DQEBCwUA
+A4IBAQA8F85MhBw5QxwrwRluL4waSXpxdRNpkN2K59eEqTUc+5lFLhinvX9WwkvR
+ToBiRpvX50GtCWZ/r5Lx2UxTyh3vKsgjhkXcvm6pvVVfqyz5pNQv3v2Q838xM98+
+15srGU9uU71McPZ5MmkmfHfgBaz5CCfUcsroJJ19pebaSARkRnb0bR36voXUbtwM
+F89PLjXUYLxSaWcOpRQ1ju0Kq7K3MDqauPzzl3HtrpGkCsoHMfb5o/HYNj+Pmxfl
+l3QH5xhOzVdioaGwE4SkY5Z5szZ8n+qi/Zd59PBCOpLoXvcB9WRTMmYkxmDOVcwI
+pQfViIYaatHkjbS/2C/Cx0hfb/6S
+-----END CERTIFICATE-----
+-----BEGIN RSA PRIVATE KEY-----
+MIIEnwIBAAKCAQBxY8hCshkKiXCUKydkrtQtQSRke28w4JotocDiVqou4k55DEDJ
+akvWbXXDcakV4HA8R2tOGgbxvTjFo8EK470w9O9ipapPUSrRRaBsSOlkaaIs6OYh
+4FLwZpqMNBVVEtguVUR/C34Y2pS9kRrHs6q+cGhDZolkWT7nGy5eSEvPDHg0EBq1
+1hu6HmPmI3r0BInONqJg2rcK3U++wk1lnbD3ysCZsKOqRUms3n/IWKeTqXXmz2XK
+J2t0NSXwiDmA9q0Gm+w0bXh3lzhtUP4MlzS+lnx9hK5bjzSbCUB5RXwMDG/uNMQq
+C4MmA4BPceSfMyAIFjdRLGy/K7gbb2viOYRtAgEDAoIBAEuX2tchZgcGSw1yGkMf
+OB4rbZhSSiCVvB5r1ew5xsnsNFCy1ducMo7zo9ehG2Pq9X2E8jQRWfZ+JdkX1gdC
+fiCjSkHDxt+LceDZFZ2F8O2bwXNF7sFAN0rvEbLNY44MkB7jgv9c/rs8YykLZy/N
+HH71mteZsO2Q1JoSHumFh99cwWHFhLxYh64qFeeH6Gqx6AM2YVBWHgs7OuKOvc8y
+zUbf8xftPht1kMwwDR1XySiEYtBtn74JflK3DcT8oxOuCZBuX6sMJHKbVP41zDj+
+FJZBmpAvNfCEYJUr1Hg+DpMLqLUg+D6v5vpliburbk9LxcKFZyyZ9QVe7GoqMLBu
+eGsCgYEAummUj4MMKWJC2mv5rj/dt2pj2/B2HtP2RLypai4et1/Ru9nNk8cjMLzC
+qXz6/RLuJ7/eD7asFS3y7EqxKxEmW0G8tTHjnzR/3wnpVipuWnwCDGU032HJVd13
+LMe51GH97qLzuDZjMCz+VlbCNdSslMgWWK0XmRnN7Yqxvh6ao2kCgYEAm7fTRBhF
+JtKcaJ7d8BQb9l8BNHfjayYOMq5CxoCyxa2pGBv/Mrnxv73Twp9Z/MP0ue5M5nZt
+GMovpP5cGdJLQ2w5p4H3opcuWeYW9Yyru2EyCEAI/hD/Td3QVP0ukc19BDuPl5Wg
+eIFs218uiVOU4pw3w+Et5B1PZ/F+ZLr5LGUCgYB8RmMKV11w7CyRnVEe1T56Ru09
+Svlp4qQt0xucHr8k6ovSkTO32hd10yxw/fyot0lv1T61JHK4yUydhyDHYMQ81n3O
+IUJqIv/qBpuOxvQ8UqwIQ3iU69uOk6TIhSaNlqlJwffQJEIgHf7kOdbOjchjMA7l
+yLpmETPzscvUFGcXmwKBgGfP4i1lg283EvBp6Uq4EqQ/ViL6l5zECXce1y8Ady5z
+xhASqiHRS9UpN9cU5qiCoyae3e75nhCGym3+6BE23Nede8UBT8G6HuaZZKOzHSeW
+IVrVW1QLVN6T4DioybaI/gLSX7pjwFBWSJI/dFuNDexoJS1AyUK+NO/2VEMnUMhD
+AoGAOsdn3Prnh/mjC95vraHCLap0bRBSexMdx77ImHgtFUUcSaT8DJHs+NZw1RdM
+SZA0J+zVQ8q7B11jIgz5hMz+chedwoRjTL7a8VRTKHFmmBH0zlEuV7L79w6HkRCQ
+VRg10GUN6heGLv0aOHbPdobcuVDH4sgOqpT1QnOuce34sQs=
+-----END RSA PRIVATE KEY-----`
+
+// RSAOAEPLabelEncryptedTestFixture declares an explicit pSpecified label
+// ("test") in addition to explicit SHA-256 digest and MGF1 parameters.
+//
+//	openssl cms -encrypt -binary -in test.txt -outform pem -recip certificate.pem -aes256 \
+//	    -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256 -keyopt rsa_mgf1_md:sha256 \
+//	    -keyopt rsa_oaep_label:74657374
+var RSAOAEPLabelEncryptedTestFixture = `
+-----BEGIN PKCS7-----
+MIIB5QYJKoZIhvcNAQcDoIIB1jCCAdICAQAxggGNMIIBiQIBADAxMCkxEDAOBgNV
+BAoTB0FjbWUgQ28xFTATBgNVBAMTDEVkZGFyZCBTdGFyawIEItzA4TBNBgkqhkiG
+9w0BAQcwQKANMAsGCWCGSAFlAwQCAaEaMBgGCSqGSIb3DQEBCDALBglghkgBZQME
+AgGiEzARBgkqhkiG9w0BAQkEBHRlc3QEggEAX4H3XKGJJyE/MtNpqq6jzWqKDZUq
+2dbaLzD16j5r6kGjJukM3ixQKb9+YMeuOMOq7wQPrbhJNAy/LRFwb3O1Iy3j9rja
+eQ3MiH3EHwtL4vzD0vNS09BAhu5Ov8C57Zi7Wo1dOP9qTbKr64gKhDfB5x7FEBE6
+OE1Vy+YFt4GKp/3A+5ADRPDwEkLJNmthbNSdfYlvjRouxWQP8pveorN8UbgZ2Yzl
+A2obnOlLwbxuKN7n4SFUxHCDO0vq3Er7ppIM9Y2v0nFC9zZt39DNSKRAwouVkAw0
+o2OAspNSn4/0WeUKDP45nffKo9sMV60X5EdKuFC21fBX681mtHGXiENCKjA8Bgkq
+hkiG9w0BBwEwHQYJYIZIAWUDBAEqBBD+6Yna4v0KOy5mcszf+muBgBBWYtl11XTL
+BnF4odqYHq0f
 -----END PKCS7-----
 -----BEGIN CERTIFICATE-----
 MIIDETCCAfmgAwIBAgIEItzA4TANBgkqhkiG9w0BAQsFADApMRAwDgYDVQQKEwdB

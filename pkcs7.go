@@ -16,7 +16,9 @@ import (
 	"sort"
 	"sync"
 
-	_ "crypto/sha1" // for crypto.SHA1
+	_ "crypto/sha1"   // for crypto.SHA1
+	_ "crypto/sha256" // for crypto.SHA224 and crypto.SHA256
+	_ "crypto/sha512" // for crypto.SHA384 and crypto.SHA512
 
 	legacyx509 "github.com/smallstep/pkcs7/internal/legacy/x509"
 )
@@ -88,6 +90,10 @@ var (
 	// Asymmetric Encryption Algorithms
 	OIDEncryptionAlgorithmRSA       = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1} // see https://www.rfc-editor.org/rfc/rfc8017#appendix-A.2.2
 	OIDEncryptionAlgorithmRSAESOAEP = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 7} // see https://www.rfc-editor.org/rfc/rfc8017#appendix-A.2.1
+
+	// RSA OAEP parameters (RFC 4055, section 3.1 / RFC 8017, appendix A.2.1)
+	OIDMaskGenAlgorithmMGF1 = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 8} // id-mgf1
+	OIDPSourceAlgorithmP    = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 9} // id-pSpecified
 
 	// Symmetric Encryption Algorithms
 	OIDEncryptionAlgorithmDESCBC     = asn1.ObjectIdentifier{1, 3, 14, 3, 2, 7}               // see https://www.rfc-editor.org/rfc/rfc8018.html#appendix-B.2.1

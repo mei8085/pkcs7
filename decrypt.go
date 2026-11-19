@@ -42,11 +42,18 @@ func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte
 		var opts crypto.DecrypterOpts
 		switch algorithm := recipient.KeyEncryptionAlgorithm.Algorithm; {
 		case algorithm.Equal(OIDEncryptionAlgorithmRSAESOAEP):
-			hashFunc, err := getHashFuncForKeyEncryptionAlgorithm(recipient.KeyEncryptionAlgorithm)
+			// Resolve and validate the complete OAEP contract (digest, MGF1
+			// digest and label) before touching the encrypted key. Any
+			// missing, conflicting or unrecognized parameter is reported
+			// here, before any RSA operation takes place.
+			params, err := getOAEPParametersForKeyEncryptionAlgorithm(recipient.KeyEncryptionAlgorithm)
 			if err != nil {
 				return nil, err
 			}
-			opts = &rsa.OAEPOptions{Hash: hashFunc}
+			opts, err = oaepDecrypterOptions(params)
+			if err != nil {
+				return nil, err
+			}
 		case algorithm.Equal(OIDEncryptionAlgorithmRSA):
 			opts = &rsa.PKCS1v15DecryptOptions{}
 		default:
@@ -54,49 +61,54 @@ func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte
 		}
 		contentKey, err := pkey.Decrypt(rand.Reader, recipient.EncryptedKey, opts)
 		if err != nil {
+			// A custom crypto.Decrypter is allowed to return a buffer even
+			// on failure; never leave key material behind.
+			wipeBytes(contentKey)
 			return nil, err
 		}
+		// The content encryption key is only needed for the symmetric
+		// decryption below. Wipe it on every return path, including error
+		// paths, so it does not linger in memory after this call and cannot
+		// leak into error reporting.
+		defer wipeBytes(contentKey)
 		return data.EncryptedContentInfo.decrypt(contentKey)
 	}
 	return nil, ErrUnsupportedAlgorithm
 }
 
-// RFC 4055, 4.1
-// The current ASN.1 parser does not support non-integer defaults so the 'default:' tags here do nothing.
-type rsaOAEPAlgorithmParameters struct {
-	HashFunc    pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:0,default:sha1Identifier"`
-	MaskGenFunc pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:1,default:mgf1SHA1Identifier"`
-	PSourceFunc pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:2,default:pSpecifiedEmptyIdentifier"`
+// wipeBytes overwrites b in place. It is used to discard the content
+// encryption key once it has served its purpose.
+func wipeBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }
 
-func getHashFuncForKeyEncryptionAlgorithm(keyEncryptionAlgorithm pkix.AlgorithmIdentifier) (crypto.Hash, error) {
-	invalidHashFunc := crypto.Hash(0)
-	params := &rsaOAEPAlgorithmParameters{
-		HashFunc: pkix.AlgorithmIdentifier{Algorithm: OIDDigestAlgorithmSHA1}, // set default hash algorithm to SHA1
+// getOAEPParametersForKeyEncryptionAlgorithm resolves the RSAES-OAEP
+// parameters declared by a key encryption algorithm identifier into the exact
+// contract to use for the RSA operation. It never falls back to a guess: an
+// absent, malformed, duplicated, conflicting or unrecognized parameter is
+// reported as ErrInvalidOAEPParameters.
+func getOAEPParametersForKeyEncryptionAlgorithm(keyEncryptionAlgorithm pkix.AlgorithmIdentifier) (rsaOAEPParameters, error) {
+	if !keyEncryptionAlgorithm.Algorithm.Equal(OIDEncryptionAlgorithmRSAESOAEP) {
+		return rsaOAEPParameters{}, fmt.Errorf("%w: algorithm %v is not RSAES-OAEP",
+			ErrInvalidOAEPParameters, keyEncryptionAlgorithm.Algorithm)
 	}
-	var rest []byte
-	rest, err := asn1.Unmarshal(keyEncryptionAlgorithm.Parameters.FullBytes, params)
-	if err != nil {
-		return invalidHashFunc, fmt.Errorf("pkcs7: failed unmarshaling key encryption algorithm parameters: %v", err)
-	}
-	if len(rest) != 0 {
-		return invalidHashFunc, errors.New("pkcs7: trailing data after RSA OAEP parameters")
-	}
+	return parseRSAOAEPParameters(keyEncryptionAlgorithm.Parameters)
+}
 
-	switch {
-	case params.HashFunc.Algorithm.Equal(OIDDigestAlgorithmSHA1):
-		return crypto.SHA1, nil
-	case params.HashFunc.Algorithm.Equal(OIDDigestAlgorithmSHA224):
-		return crypto.SHA224, nil
-	case params.HashFunc.Algorithm.Equal(OIDDigestAlgorithmSHA256):
-		return crypto.SHA256, nil
-	case params.HashFunc.Algorithm.Equal(OIDDigestAlgorithmSHA384):
-		return crypto.SHA384, nil
-	case params.HashFunc.Algorithm.Equal(OIDDigestAlgorithmSHA512):
-		return crypto.SHA512, nil
-	default:
-		return invalidHashFunc, errors.New("pkcs7: unsupported hash function for RSA OAEP")
+// getHashFuncForKeyEncryptionAlgorithm returns the OAEP digest algorithm
+// declared by a key encryption algorithm identifier.
+//
+// It is the digest-only view of getOAEPParametersForKeyEncryptionAlgorithm and
+// still validates the whole parameter set, so it does not accept parameters
+// that the full contract would reject.
+func getHashFuncForKeyEncryptionAlgorithm(keyEncryptionAlgorithm pkix.AlgorithmIdentifier) (crypto.Hash, error) {
+	params, err := getOAEPParametersForKeyEncryptionAlgorithm(keyEncryptionAlgorithm)
+	if err != nil {
+		return crypto.Hash(0), err
 	}
+	return params.Hash, nil
 }
 
 // DecryptUsingPSK decrypts encrypted data using caller provided

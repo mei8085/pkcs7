@@ -310,12 +310,18 @@ func Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
 		algorithm := KeyEncryptionAlgorithm
 		hash := KeyEncryptionHash
 		var kea pkix.AlgorithmIdentifier
+		var oaepParams *rsaOAEPParameters
 		switch {
 		case algorithm.Equal(OIDEncryptionAlgorithmRSAESOAEP):
-			parameters, err := getParametersForKeyEncryptionAlgorithm(algorithm, hash)
+			// Resolve the parameters once and use the same value both to
+			// declare the parameters in the envelope and to perform the RSA
+			// operation: the digest, MGF1 digest and label cannot disagree.
+			params := rsaOAEPParametersForEncryption(hash)
+			parameters, err := marshalRSAOAEPParameters(params)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get parameters for key encryption: %v", err)
+				return nil, fmt.Errorf("failed to get parameters for key encryption: %w", err)
 			}
+			oaepParams = &params
 			kea = pkix.AlgorithmIdentifier{
 				Algorithm:  algorithm,
 				Parameters: parameters,
@@ -327,7 +333,7 @@ func Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
 		default:
 			return nil, ErrUnsupportedKeyEncryptionAlgorithm
 		}
-		encrypted, err := encryptKey(key, recipient, algorithm, hash)
+		encrypted, err := encryptKey(key, recipient, algorithm, oaepParams)
 		if err != nil {
 			return nil, err
 		}
@@ -362,37 +368,6 @@ func Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
 	}
 
 	return asn1.Marshal(wrapper)
-}
-
-func getParametersForKeyEncryptionAlgorithm(algorithm asn1.ObjectIdentifier, hash crypto.Hash) (asn1.RawValue, error) {
-	if !algorithm.Equal(OIDEncryptionAlgorithmRSAESOAEP) {
-		return asn1.RawValue{}, nil // return empty; not used
-	}
-
-	params := rsaOAEPAlgorithmParameters{}
-	switch hash {
-	case crypto.SHA1:
-		params.HashFunc = pkix.AlgorithmIdentifier{Algorithm: OIDDigestAlgorithmSHA1}
-	case crypto.SHA224:
-		params.HashFunc = pkix.AlgorithmIdentifier{Algorithm: OIDDigestAlgorithmSHA224}
-	case crypto.SHA256:
-		params.HashFunc = pkix.AlgorithmIdentifier{Algorithm: OIDDigestAlgorithmSHA256}
-	case crypto.SHA384:
-		params.HashFunc = pkix.AlgorithmIdentifier{Algorithm: OIDDigestAlgorithmSHA384}
-	case crypto.SHA512:
-		params.HashFunc = pkix.AlgorithmIdentifier{Algorithm: OIDDigestAlgorithmSHA512}
-	default:
-		return asn1.RawValue{}, ErrUnsupportedAlgorithm
-	}
-
-	b, err := asn1.Marshal(params)
-	if err != nil {
-		return asn1.RawValue{}, fmt.Errorf("failed marshaling key encryption parameters: %v", err)
-	}
-
-	return asn1.RawValue{
-		FullBytes: b,
-	}, nil
 }
 
 // EncryptUsingPSK creates and returns an encrypted data PKCS7 structure,
@@ -446,7 +421,14 @@ func marshalEncryptedContent(content []byte) asn1.RawValue {
 	return asn1.RawValue{Bytes: content, Class: 2, IsCompound: false}
 }
 
-func encryptKey(key []byte, recipient *x509.Certificate, algorithm asn1.ObjectIdentifier, hash crypto.Hash) ([]byte, error) {
+// encryptKey encrypts the content key for a single recipient.
+//
+// For RSAES-OAEP the caller passes the resolved parameters that were written
+// into that recipient's keyEncryptionAlgorithm, and exactly those parameters
+// drive rsa.EncryptOAEP. This keeps the declaration and the operation on the
+// same contract; passing nil for oaepParams is a programming error and is
+// reported as such rather than silently using different parameters.
+func encryptKey(key []byte, recipient *x509.Certificate, algorithm asn1.ObjectIdentifier, oaepParams *rsaOAEPParameters) ([]byte, error) {
 	pub, ok := recipient.PublicKey.(*rsa.PublicKey)
 	if !ok {
 		return nil, ErrUnsupportedKeyType
@@ -456,7 +438,23 @@ func encryptKey(key []byte, recipient *x509.Certificate, algorithm asn1.ObjectId
 	case algorithm.Equal(OIDEncryptionAlgorithmRSA):
 		return rsa.EncryptPKCS1v15(rand.Reader, pub, key)
 	case algorithm.Equal(OIDEncryptionAlgorithmRSAESOAEP):
-		return rsa.EncryptOAEP(hash.New(), rand.Reader, pub, key, nil)
+		if oaepParams == nil {
+			return nil, fmt.Errorf("%w: RSAES-OAEP parameters were not resolved", ErrInvalidOAEPParameters)
+		}
+		if !oaepParams.Hash.Available() {
+			return nil, ErrUnsupportedKeyEncryptionHash
+		}
+		// crypto/rsa.EncryptOAEP only performs OAEP with the same digest for
+		// MGF1 and does not take a label. Refuse a contract that would need
+		// anything else instead of encrypting something the declaration does
+		// not describe.
+		if oaepParams.MGFHash != oaepParams.Hash {
+			return nil, fmt.Errorf("%w: RSAES-OAEP encryption requires the same digest for MGF1", ErrInvalidOAEPParameters)
+		}
+		if len(oaepParams.Label) != 0 {
+			return nil, fmt.Errorf("%w: RSAES-OAEP encryption does not support a label", ErrInvalidOAEPParameters)
+		}
+		return rsa.EncryptOAEP(oaepParams.Hash.New(), rand.Reader, pub, key, oaepParams.Label)
 	default:
 		return nil, ErrUnsupportedKeyEncryptionAlgorithm
 	}

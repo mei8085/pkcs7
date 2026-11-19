@@ -109,44 +109,98 @@ func TestPad(t *testing.T) {
 	}
 }
 
-func Test_getParametersForKeyEncryptionAlgorithm(t *testing.T) {
-	type args struct {
-		algorithm asn1.ObjectIdentifier
-		hash      crypto.Hash
-	}
+func Test_marshalAndParseRSAOAEPParameters(t *testing.T) {
 	tests := []struct {
-		name   string
-		args   args
-		expErr error
+		name string
+		hash crypto.Hash
 	}{
-		{name: "sha256", args: args{algorithm: OIDEncryptionAlgorithmRSAESOAEP, hash: crypto.SHA256}},
-		{name: "sha512", args: args{algorithm: OIDEncryptionAlgorithmRSAESOAEP, hash: crypto.SHA512}},
+		{name: "sha1", hash: crypto.SHA1},
+		{name: "sha224", hash: crypto.SHA224},
+		{name: "sha256", hash: crypto.SHA256},
+		{name: "sha384", hash: crypto.SHA384},
+		{name: "sha512", hash: crypto.SHA512},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := getParametersForKeyEncryptionAlgorithm(tt.args.algorithm, tt.args.hash)
-			if tt.expErr != nil {
-				if err == nil {
-					t.Errorf("getParametersForKeyEncryptionAlgorithm() error = %v, expErr %v", err, tt.expErr)
-					return
-				}
-				if err.Error() != tt.expErr.Error() {
-					t.Errorf("getParametersForKeyEncryptionAlgorithm() = %v, want %v", err.Error(), tt.expErr.Error())
-					return
-				}
-			}
-
-			// test if the reverse operation results in the same value
-			alg := pkix.AlgorithmIdentifier{Algorithm: tt.args.algorithm, Parameters: got}
-			resultHash, err := getHashFuncForKeyEncryptionAlgorithm(alg)
+			// The parameters that are written must describe the operation
+			// that encryption performs: the same digest for OAEP and MGF1.
+			requested := rsaOAEPParametersForEncryption(tt.hash)
+			got, err := marshalRSAOAEPParameters(requested)
 			if err != nil {
-				t.Errorf("getHashFuncForKeyEncryptionAlgorithm errors = %v", err)
+				t.Fatalf("marshalRSAOAEPParameters() error = %v", err)
 			}
 
-			if resultHash != tt.args.hash {
-				t.Errorf("getHashFuncForKeyEncryptionAlgorithm() = %v, want %v", resultHash, tt.args.hash)
+			// test if the reverse operation results in the same contract
+			alg := pkix.AlgorithmIdentifier{Algorithm: OIDEncryptionAlgorithmRSAESOAEP, Parameters: got}
+			parsed, err := getOAEPParametersForKeyEncryptionAlgorithm(alg)
+			if err != nil {
+				t.Fatalf("getOAEPParametersForKeyEncryptionAlgorithm() error = %v", err)
+			}
+			if parsed.Hash != requested.Hash {
+				t.Errorf("parsed hash = %v, want %v", parsed.Hash, requested.Hash)
+			}
+			if parsed.MGFHash != requested.MGFHash {
+				t.Errorf("parsed MGF1 hash = %v, want %v", parsed.MGFHash, requested.MGFHash)
+			}
+			if !bytes.Equal(parsed.Label, requested.Label) {
+				t.Errorf("parsed label = %x, want %x", parsed.Label, requested.Label)
+			}
+
+			// The declared parameters must agree with the operation that
+			// Encrypt actually performs.
+			declaredHash, err := getHashFuncForKeyEncryptionAlgorithm(alg)
+			if err != nil {
+				t.Fatalf("getHashFuncForKeyEncryptionAlgorithm() error = %v", err)
+			}
+			if declaredHash != tt.hash {
+				t.Errorf("getHashFuncForKeyEncryptionAlgorithm() = %v, want %v", declaredHash, tt.hash)
 			}
 		})
+	}
+}
+
+func TestMarshalRSAOAEPParametersEncoding(t *testing.T) {
+	// SHA-1 is the default for both the digest and MGF1, so the canonical
+	// encoding is the empty SEQUENCE, exactly as OpenSSL emits it.
+	params, err := marshalRSAOAEPParameters(rsaOAEPParametersForEncryption(crypto.SHA1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(params.FullBytes, []byte{0x30, 0x00}) {
+		t.Errorf("SHA-1 parameters = %x, want 3000", params.FullBytes)
+	}
+
+	// Any other digest must be written out, both as hashAlgorithm and as the
+	// digest used by the MGF1 mask generation function. Omitting the latter
+	// would declare the MGF1-SHA-1 default while computing MGF1 with the
+	// selected digest.
+	for _, hash := range []crypto.Hash{crypto.SHA224, crypto.SHA256, crypto.SHA384, crypto.SHA512} {
+		raw, err := marshalRSAOAEPParameters(rsaOAEPParametersForEncryption(hash))
+		if err != nil {
+			t.Fatalf("%v: %v", hash, err)
+		}
+		var decoded rsaOAEPAlgorithmParameters
+		rest, err := asn1.Unmarshal(raw.FullBytes, &decoded)
+		if err != nil {
+			t.Fatalf("%v: %v", hash, err)
+		}
+		if len(rest) != 0 {
+			t.Fatalf("%v: trailing data", hash)
+		}
+		wantOID, _ := oidForHash(hash)
+		if !decoded.HashFunc.Algorithm.Equal(wantOID) {
+			t.Errorf("%v: hashAlgorithm = %v, want %v", hash, decoded.HashFunc.Algorithm, wantOID)
+		}
+		if !decoded.MaskGenFunc.Algorithm.Equal(OIDMaskGenAlgorithmMGF1) {
+			t.Errorf("%v: maskGenAlgorithm = %v, want MGF1", hash, decoded.MaskGenFunc.Algorithm)
+		}
+		var mgfHash pkix.AlgorithmIdentifier
+		if _, err := asn1.Unmarshal(decoded.MaskGenFunc.Parameters.FullBytes, &mgfHash); err != nil {
+			t.Fatalf("%v: cannot parse MGF1 parameters: %v", hash, err)
+		}
+		if !mgfHash.Algorithm.Equal(wantOID) {
+			t.Errorf("%v: MGF1 digest = %v, want %v", hash, mgfHash.Algorithm, wantOID)
+		}
 	}
 }
 
@@ -229,5 +283,144 @@ func TestEncryptAndDecryptWithOpenSSL(t *testing.T) {
 
 	if !bytes.Equal(content, out) {
 		t.Errorf("EncryptAndDecryptWithOpenSSL() = %v, want %v", out, content)
+	}
+}
+
+// TestEncryptDecryptOAEPRoundTrip exercises the full contract for every
+// supported digest: the envelope written by Encrypt must be decryptable by
+// Decrypt, and the parameters it carries must match the digest that was
+// requested.
+func TestEncryptDecryptOAEPRoundTrip(t *testing.T) {
+	fixture := UnmarshalTestFixture(RSAOAEPSHA256EncryptedTestFixture)
+	plaintext := []byte("Hello Secret World!")
+
+	currentAlgorithm := ContentEncryptionAlgorithm
+	currentKeyAlgorithm := KeyEncryptionAlgorithm
+	currentHash := KeyEncryptionHash
+	defer func() {
+		ContentEncryptionAlgorithm = currentAlgorithm
+		KeyEncryptionAlgorithm = currentKeyAlgorithm
+		KeyEncryptionHash = currentHash
+	}()
+
+	ContentEncryptionAlgorithm = EncryptionAlgorithmAES256CBC
+	KeyEncryptionAlgorithm = OIDEncryptionAlgorithmRSAESOAEP
+
+	for _, hash := range []crypto.Hash{crypto.SHA1, crypto.SHA224, crypto.SHA256, crypto.SHA384, crypto.SHA512} {
+		t.Run(hash.String(), func(t *testing.T) {
+			KeyEncryptionHash = hash
+
+			encrypted, err := Encrypt(plaintext, []*x509.Certificate{fixture.Certificate})
+			if err != nil {
+				t.Fatalf("Encrypt() error = %v", err)
+			}
+
+			p7, err := Parse(encrypted)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+
+			// The parameters in the envelope must resolve to the digest
+			// that was requested, both as the OAEP digest and (because
+			// that is what Encrypt performs) as the MGF1 digest.
+			ed := p7.raw.(envelopedData)
+			if len(ed.RecipientInfos) != 1 {
+				t.Fatalf("got %d recipients, want 1", len(ed.RecipientInfos))
+			}
+			params, err := getOAEPParametersForKeyEncryptionAlgorithm(ed.RecipientInfos[0].KeyEncryptionAlgorithm)
+			if err != nil {
+				t.Fatalf("envelope carried unusable parameters: %v", err)
+			}
+			if params.Hash != hash {
+				t.Errorf("declared digest = %v, want %v", params.Hash, hash)
+			}
+			if params.MGFHash != hash {
+				t.Errorf("declared MGF1 digest = %v, want %v (the digest Encrypt uses)", params.MGFHash, hash)
+			}
+			if len(params.Label) != 0 {
+				t.Errorf("declared label = %x, want empty", params.Label)
+			}
+
+			content, err := p7.Decrypt(fixture.Certificate, fixture.PrivateKey)
+			if err != nil {
+				t.Fatalf("Decrypt() error = %v", err)
+			}
+			if !bytes.Equal(content, plaintext) {
+				t.Errorf("decrypted = %q, want %q", content, plaintext)
+			}
+		})
+	}
+}
+
+// TestEncryptOAEPInteropWithOpenSSL checks that OpenSSL accepts the envelope
+// this package writes, for the default parameters and for explicit SHA-256
+// parameters. This is the interoperability half of the contract: a declared
+// parameter set must be one other implementations also honour.
+func TestEncryptOAEPInteropWithOpenSSL(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not available")
+	}
+
+	fixture := UnmarshalTestFixture(RSAOAEPSHA256EncryptedTestFixture)
+	content := []byte("openssl interop content")
+
+	currentAlgorithm := ContentEncryptionAlgorithm
+	currentKeyAlgorithm := KeyEncryptionAlgorithm
+	currentHash := KeyEncryptionHash
+	defer func() {
+		ContentEncryptionAlgorithm = currentAlgorithm
+		KeyEncryptionAlgorithm = currentKeyAlgorithm
+		KeyEncryptionHash = currentHash
+	}()
+	ContentEncryptionAlgorithm = EncryptionAlgorithmAES256CBC
+	KeyEncryptionAlgorithm = OIDEncryptionAlgorithmRSAESOAEP
+
+	for _, hash := range []crypto.Hash{crypto.SHA1, crypto.SHA256, crypto.SHA512} {
+		t.Run(hash.String(), func(t *testing.T) {
+			KeyEncryptionHash = hash
+			encrypted, err := Encrypt(content, []*x509.Certificate{fixture.Certificate})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			contentFile, err := ioutil.TempFile("", "content")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(contentFile.Name())
+			if err := pem.Encode(contentFile, &pem.Block{Type: "PKCS7", Bytes: encrypted}); err != nil {
+				t.Fatal(err)
+			}
+			contentFile.Close()
+
+			recipientFile, err := ioutil.TempFile("", "recipient")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(recipientFile.Name())
+			if err := pem.Encode(recipientFile, &pem.Block{Type: "CERTIFICATE", Bytes: fixture.Certificate.Raw}); err != nil {
+				t.Fatal(err)
+			}
+			privateKey, err := x509.MarshalPKCS8PrivateKey(fixture.PrivateKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := pem.Encode(recipientFile, &pem.Block{Type: "PRIVATE KEY", Bytes: privateKey}); err != nil {
+				t.Fatal(err)
+			}
+			recipientFile.Close()
+
+			out, err := exec.Command("openssl", "cms", "-decrypt",
+				"-inform", "pem",
+				"-in", contentFile.Name(),
+				"-recip", recipientFile.Name(),
+			).CombinedOutput()
+			if err != nil {
+				t.Fatalf("openssl failed to decrypt an envelope with declared %v parameters: %s: %s", hash, err, out)
+			}
+			if !bytes.Equal(out, content) {
+				t.Errorf("openssl decrypted %q, want %q", out, content)
+			}
+		})
 	}
 }
