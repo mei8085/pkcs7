@@ -35,7 +35,7 @@ func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte
 	}
 	recipient := selectRecipientForCertificate(data.RecipientInfos, cert)
 	if recipient.EncryptedKey == nil {
-		return nil, errors.New("pkcs7: no enveloped recipient for provided certificate")
+		return nil, ErrNoCertificateForRecipient
 	}
 	switch pkey := pkey.(type) {
 	case crypto.Decrypter:
@@ -225,7 +225,13 @@ func unpad(data []byte, blocklen int) ([]byte, error) {
 
 func selectRecipientForCertificate(recipients []recipientInfo, cert *x509.Certificate) recipientInfo {
 	for _, recp := range recipients {
-		if isCertMatchForIssuerAndSerial(cert, recp.IssuerAndSerialNumber) {
+		id, err := parseIdentifier(recp.RecipientIdentifier)
+		if err != nil {
+			// A recipient with a missing or malformed identifier can never
+			// match a certificate; skip it.
+			continue
+		}
+		if id.matches(cert) {
 			return recp
 		}
 	}

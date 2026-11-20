@@ -73,9 +73,9 @@ func (e *SigningTimeNotValidError) Error() string {
 
 func verifySignatureAtTime(p7 *PKCS7, signer signerInfo, truststore *x509.CertPool, currentTime time.Time) (err error) {
 	signedData := p7.Content
-	ee := getCertFromCertsByIssuerAndSerial(p7.Certificates, signer.IssuerAndSerialNumber)
-	if ee == nil {
-		return errors.New("pkcs7: No certificate for signer")
+	ee, err := getCertForSignerInfo(p7.Certificates, signer)
+	if err != nil {
+		return err
 	}
 	if len(signer.AuthenticatedAttributes) > 0 {
 		// TODO(fullsailor): First check the content type match
@@ -132,9 +132,9 @@ func verifySignatureAtTime(p7 *PKCS7, signer signerInfo, truststore *x509.CertPo
 
 func verifySignature(p7 *PKCS7, signer signerInfo, truststore *x509.CertPool) (err error) {
 	signedData := p7.Content
-	ee := getCertFromCertsByIssuerAndSerial(p7.Certificates, signer.IssuerAndSerialNumber)
-	if ee == nil {
-		return errors.New("pkcs7: No certificate for signer")
+	ee, err := getCertForSignerInfo(p7.Certificates, signer)
+	if err != nil {
+		return err
 	}
 	signingTime := time.Now().UTC()
 	if len(signer.AuthenticatedAttributes) > 0 {
@@ -193,8 +193,11 @@ func (p7 *PKCS7) GetOnlySigner() *x509.Certificate {
 	if len(p7.Signers) != 1 {
 		return nil
 	}
-	signer := p7.Signers[0]
-	return getCertFromCertsByIssuerAndSerial(p7.Certificates, signer.IssuerAndSerialNumber)
+	ee, err := getCertForSignerInfo(p7.Certificates, p7.Signers[0])
+	if err != nil {
+		return nil
+	}
+	return ee
 }
 
 // UnmarshalSignedAttribute decodes a single attribute from the signer info
@@ -349,13 +352,25 @@ func getSignatureAlgorithm(digestEncryption, digest pkix.AlgorithmIdentifier) (x
 	}
 }
 
-func getCertFromCertsByIssuerAndSerial(certs []*x509.Certificate, ias issuerAndSerial) *x509.Certificate {
-	for _, cert := range certs {
-		if isCertMatchForIssuerAndSerial(cert, ias) {
-			return cert
-		}
+// getCertForSignerInfo returns the certificate from certs that the signer
+// info identifies, whether by issuerAndSerialNumber or by
+// subjectKeyIdentifier. It returns ErrMissingIdentifier or
+// ErrMalformedIdentifier for identifiers that cannot be decoded,
+// ErrDuplicateIdentifier when several distinct certificates match, and
+// ErrNoCertificateForSigner when none do.
+func getCertForSignerInfo(certs []*x509.Certificate, signer signerInfo) (*x509.Certificate, error) {
+	id, err := parseIdentifier(signer.SignerIdentifier)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	cert, err := selectCertificate(certs, id)
+	if err != nil {
+		return nil, err
+	}
+	if cert == nil {
+		return nil, ErrNoCertificateForSigner
+	}
+	return cert, nil
 }
 
 func unmarshalAttribute(attrs []attribute, attributeType asn1.ObjectIdentifier, out interface{}) error {

@@ -91,6 +91,13 @@ func NewSignedData(data []byte) (*SignedData, error) {
 type SignerInfoConfig struct {
 	ExtraSignedAttributes   []Attribute
 	ExtraUnsignedAttributes []Attribute
+
+	// UseSubjectKeyIdentifier identifies the signer by the subject key
+	// identifier of the signer certificate (SignerInfo version 3) instead of
+	// by issuer and serial number (SignerInfo version 1). The signer
+	// certificate must contain a SubjectKeyId, otherwise adding the signer
+	// fails with ErrNoSubjectKeyIdentifier.
+	UseSubjectKeyIdentifier bool
 }
 
 type signedData struct {
@@ -102,9 +109,13 @@ type signedData struct {
 	SignerInfos                []signerInfo           `asn1:"set"`
 }
 
+// signerInfo is a CMS SignerInfo (RFC 5652, section 5.3). SignerIdentifier
+// holds the SignerIdentifier CHOICE in raw form: either a SEQUENCE containing
+// an issuerAndSerialNumber, or the context-specific primitive tag [0]
+// holding a subjectKeyIdentifier. Use parseIdentifier to decode it.
 type signerInfo struct {
 	Version                   int `asn1:"default:1"`
-	IssuerAndSerialNumber     issuerAndSerial
+	SignerIdentifier          asn1.RawValue
 	DigestAlgorithm           pkix.AlgorithmIdentifier
 	AuthenticatedAttributes   []attribute `asn1:"optional,omitempty,tag:0"`
 	DigestEncryptionAlgorithm pkix.AlgorithmIdentifier
@@ -186,6 +197,10 @@ func (sd *SignedData) AddSignerChain(ee *x509.Certificate, pkey crypto.PrivateKe
 		// the first parent is the issuer
 		ias.IssuerName = asn1.RawValue{FullBytes: parents[0].RawSubject}
 	}
+	signerIdentifier, signerVersion, err := makeSignerIdentifier(ee, ias, config.UseSubjectKeyIdentifier)
+	if err != nil {
+		return err
+	}
 	sd.sd.DigestAlgorithmIdentifiers = append(sd.sd.DigestAlgorithmIdentifiers,
 		pkix.AlgorithmIdentifier{Algorithm: sd.digestOid},
 	)
@@ -229,9 +244,14 @@ func (sd *SignedData) AddSignerChain(ee *x509.Certificate, pkey crypto.PrivateKe
 		UnauthenticatedAttributes: finalUnsignedAttrs,
 		DigestAlgorithm:           pkix.AlgorithmIdentifier{Algorithm: sd.digestOid},
 		DigestEncryptionAlgorithm: pkix.AlgorithmIdentifier{Algorithm: encryptionOid},
-		IssuerAndSerialNumber:     ias,
+		SignerIdentifier:          signerIdentifier,
 		EncryptedDigest:           signature,
-		Version:                   1,
+		Version:                   signerVersion,
+	}
+	if signerVersion > sd.sd.Version {
+		// RFC 5652, section 5.1: the SignedData version must be 3 when any
+		// SignerInfo uses a subjectKeyIdentifier (SignerInfo version 3).
+		sd.sd.Version = signerVersion
 	}
 	sd.certs = append(sd.certs, ee)
 	if len(parents) > 0 {
@@ -284,6 +304,10 @@ func (sd *SignedData) SignWithoutAttr(ee *x509.Certificate, pkey crypto.PrivateK
 	ias.SerialNumber = ee.SerialNumber
 	// no parent, the issue is the end-entity cert itself
 	ias.IssuerName = asn1.RawValue{FullBytes: ee.RawIssuer}
+	signerIdentifier, signerVersion, err := makeSignerIdentifier(ee, ias, config.UseSubjectKeyIdentifier)
+	if err != nil {
+		return err
+	}
 	if sd.encryptionOid == nil {
 		// if the encryption algorithm wasn't set by SetEncryptionAlgorithm,
 		// infer it from the digest algorithm
@@ -295,9 +319,12 @@ func (sd *SignedData) SignWithoutAttr(ee *x509.Certificate, pkey crypto.PrivateK
 	signer := signerInfo{
 		DigestAlgorithm:           pkix.AlgorithmIdentifier{Algorithm: sd.digestOid},
 		DigestEncryptionAlgorithm: pkix.AlgorithmIdentifier{Algorithm: sd.encryptionOid},
-		IssuerAndSerialNumber:     ias,
+		SignerIdentifier:          signerIdentifier,
 		EncryptedDigest:           signature,
-		Version:                   1,
+		Version:                   signerVersion,
+	}
+	if signerVersion > sd.sd.Version {
+		sd.sd.Version = signerVersion
 	}
 	// create signature of signed attributes
 	sd.certs = append(sd.certs, ee)
@@ -392,6 +419,28 @@ func cert2issuerAndSerial(cert *x509.Certificate) (issuerAndSerial, error) {
 	ias.SerialNumber = cert.SerialNumber
 
 	return ias, nil
+}
+
+// makeSignerIdentifier builds the SignerIdentifier CHOICE for a signer and
+// returns it together with the corresponding SignerInfo version (RFC 5652,
+// section 5.3): version 1 for issuerAndSerialNumber, version 3 for
+// subjectKeyIdentifier.
+func makeSignerIdentifier(ee *x509.Certificate, ias issuerAndSerial, useSKID bool) (asn1.RawValue, int, error) {
+	if useSKID {
+		if len(ee.SubjectKeyId) == 0 {
+			return asn1.RawValue{}, 0, fmt.Errorf("%w for signer %q", ErrNoSubjectKeyIdentifier, ee.Subject.CommonName)
+		}
+		raw, err := marshalSKIDIdentifier(ee.SubjectKeyId)
+		if err != nil {
+			return asn1.RawValue{}, 0, err
+		}
+		return raw, 3, nil
+	}
+	raw, err := marshalIssuerAndSerialIdentifier(ias)
+	if err != nil {
+		return asn1.RawValue{}, 0, err
+	}
+	return raw, 1, nil
 }
 
 // signs the DER encoded form of the attributes with the private key

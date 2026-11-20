@@ -535,9 +535,9 @@ func TestVerifyFirefoxAddon(t *testing.T) {
 
 	// Verify the certificate chain to make sure the identified root
 	// is the one we expect
-	ee := getCertFromCertsByIssuerAndSerial(p7.Certificates, p7.Signers[0].IssuerAndSerialNumber)
-	if ee == nil {
-		t.Errorf("No end-entity certificate found for signer")
+	ee, err := getCertForSignerInfo(p7.Certificates, p7.Signers[0])
+	if err != nil {
+		t.Errorf("No end-entity certificate found for signer: %v", err)
 	}
 	signingTime := mustParseTime("2017-02-23T09:06:16-05:00")
 	chains, err := verifyCertChain(ee, p7.Certificates, certPool, signingTime)
@@ -826,9 +826,9 @@ but that's not what ships are built for.
 				}
 				// Verify the certificate chain to make sure the identified root
 				// is the one we expect
-				ee := getCertFromCertsByIssuerAndSerial(p7.Certificates, p7.Signers[0].IssuerAndSerialNumber)
-				if ee == nil {
-					t.Fatalf("No end-entity certificate found for signer")
+				ee, err := getCertForSignerInfo(p7.Certificates, p7.Signers[0])
+				if err != nil {
+					t.Fatalf("No end-entity certificate found for signer: %v", err)
 				}
 				chains, err := verifyCertChain(ee, p7.Certificates, truststore, time.Now())
 				if err != nil {

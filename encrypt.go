@@ -26,9 +26,14 @@ type encryptedData struct {
 	EncryptedContentInfo encryptedContentInfo
 }
 
+// recipientInfo is a CMS KeyTransRecipientInfo (RFC 5652, section 6.2.1).
+// RecipientIdentifier holds the RecipientIdentifier CHOICE in raw form:
+// either a SEQUENCE containing an issuerAndSerialNumber, or the
+// context-specific primitive tag [0] holding a subjectKeyIdentifier. Use
+// parseIdentifier to decode it.
 type recipientInfo struct {
 	Version                int
-	IssuerAndSerialNumber  issuerAndSerial
+	RecipientIdentifier    asn1.RawValue
 	KeyEncryptionAlgorithm pkix.AlgorithmIdentifier
 	EncryptedKey           []byte
 }
@@ -279,6 +284,19 @@ func encryptAESCBC(content []byte, key []byte) ([]byte, *encryptedContentInfo, e
 //
 // TODO(fullsailor): Add support for encrypting content with other algorithms
 func Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
+	return encrypt(content, recipients, false)
+}
+
+// EncryptWithSKID is like Encrypt, but identifies each recipient by the
+// subject key identifier of the recipient certificate (KeyTransRecipientInfo
+// version 2) instead of by issuer and serial number. Every recipient
+// certificate must contain a SubjectKeyId, otherwise encryption fails with
+// ErrNoSubjectKeyIdentifier.
+func EncryptWithSKID(content []byte, recipients []*x509.Certificate) ([]byte, error) {
+	return encrypt(content, recipients, true)
+}
+
+func encrypt(content []byte, recipients []*x509.Certificate, useSKID bool) ([]byte, error) {
 	var eci *encryptedContentInfo
 	var key []byte
 	var err error
@@ -331,13 +349,32 @@ func Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		ias, err := cert2issuerAndSerial(recipient)
-		if err != nil {
-			return nil, err
+		// RFC 5652, section 6.2.1: the KeyTransRecipientInfo version is 0
+		// for issuerAndSerialNumber and 2 for subjectKeyIdentifier.
+		var rid asn1.RawValue
+		version := 0
+		if useSKID {
+			if len(recipient.SubjectKeyId) == 0 {
+				return nil, fmt.Errorf("%w for recipient %q", ErrNoSubjectKeyIdentifier, recipient.Subject.CommonName)
+			}
+			rid, err = marshalSKIDIdentifier(recipient.SubjectKeyId)
+			if err != nil {
+				return nil, err
+			}
+			version = 2
+		} else {
+			ias, err := cert2issuerAndSerial(recipient)
+			if err != nil {
+				return nil, err
+			}
+			rid, err = marshalIssuerAndSerialIdentifier(ias)
+			if err != nil {
+				return nil, err
+			}
 		}
 		info := recipientInfo{
-			Version:                0,
-			IssuerAndSerialNumber:  ias,
+			Version:                version,
+			RecipientIdentifier:    rid,
 			KeyEncryptionAlgorithm: kea,
 			EncryptedKey:           encrypted,
 		}
@@ -349,6 +386,11 @@ func Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
 		EncryptedContentInfo: *eci,
 		Version:              0,
 		RecipientInfos:       recipientInfos,
+	}
+	if useSKID {
+		// RFC 5652, section 6.1: the EnvelopedData version must be 2 when
+		// any RecipientInfo is version 2.
+		envelope.Version = 2
 	}
 	innerContent, err := asn1.Marshal(envelope)
 	if err != nil {
